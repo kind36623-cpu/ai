@@ -1,9 +1,10 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from app.core.config import Settings
 from app.models.schemas import ChatRequest, ChatResponse
 from app.memory.pinecone_db import memory_graph
 from app.psychology.analyzer import psychology_analyzer
-import json
+import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -12,12 +13,14 @@ logger = logging.getLogger(__name__)
 _settings = Settings()
 
 # Use latest available model
-PRIMARY_MODEL  = "gemini-flash-latest"
-REASONING_MODEL = "gemini-pro-latest"
+PRIMARY_MODEL   = "gemini-2.0-flash"
+REASONING_MODEL = "gemini-2.0-flash"
 
+# Initialize client
+client = None
 if _settings.gemini_api_key:
-    genai.configure(api_key=_settings.gemini_api_key)
-    logger.info(f"Gemini API initialized. Primary model: {PRIMARY_MODEL}")
+    client = genai.Client(api_key=_settings.gemini_api_key)
+    logger.info(f"Gemini API (google.genai) initialized. Model: {PRIMARY_MODEL}")
 else:
     logger.warning("Gemini API key not found. Orchestrator will fail.")
 
@@ -34,8 +37,6 @@ You are a private, self-evolving, personal artificial superintelligence assistan
 
 Current Phase: Phase 4 (Core Intelligence, Memory Graph, and Psychology Layer active).
 """
-
-import os
 
 def edit_desktop_ui(filename: str, file_content: str) -> str:
     """
@@ -54,33 +55,25 @@ def edit_desktop_ui(filename: str, file_content: str) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
+
 class Orchestrator:
     def __init__(self):
         self.is_mock = False
-        self.model = genai.GenerativeModel(
-            model_name=PRIMARY_MODEL,
-            system_instruction=MASTER_SYSTEM_PROMPT,
-            tools=[edit_desktop_ui]
-        )
-        self.chat_sessions = {}
+        self.chat_sessions = {}  # session_id -> list of message dicts
 
-    def _get_chat_session(self, session_id: str):
+    def _get_history(self, session_id: str):
         if session_id not in self.chat_sessions:
-            self.chat_sessions[session_id] = self.model.start_chat(
-                history=[],
-                enable_automatic_function_calling=True
-            )
+            self.chat_sessions[session_id] = []
         return self.chat_sessions[session_id]
 
     async def process_request(self, request: ChatRequest) -> ChatResponse:
         """
         Layer 4: AI Core (Orchestrator)
-        Parses request, analyzes psychology, retrieves memories, builds context, dispatches to Gemini.
         """
         logger.info(f"Processing request in Orchestrator. Session: {request.session_id}")
         
         session_id = request.session_id or "default_session"
-        chat = self._get_chat_session(session_id)
+        history = self._get_history(session_id)
 
         # 1. Psychology Analysis (Layer 3)
         psyche = psychology_analyzer.analyze_state(request.message)
@@ -95,18 +88,28 @@ class Orchestrator:
         if past_memories:
             memory_block = f"\n\n[RETRIEVED MEMORIES]\n{past_memories}"
 
-        # 3. Sensor Context (Layer 4.2)
-        context_block = ""
-        if request.context:
-            context_block = f"\n\n[SENSOR DATA]\nBattery: {request.context.battery_level}%\nActivity: {request.context.activity}"
+        enriched_prompt = f"{request.message}{psyche_block}{memory_block}"
 
-        enriched_prompt = f"{request.message}{psyche_block}{memory_block}{context_block}"
+        # 3. Build contents list with history
+        contents = list(history)
+        contents.append({"role": "user", "parts": [{"text": enriched_prompt}]})
 
-        # 4. Dispatch to Reasoning Model (Layer 7.1)
+        # 4. Dispatch to Gemini
         try:
-            response = await chat.send_message_async(enriched_prompt)
+            response = client.models.generate_content(
+                model=PRIMARY_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=MASTER_SYSTEM_PROMPT,
+                    temperature=0.7,
+                )
+            )
             reply_text = response.text
-            
+
+            # Update history
+            history.append({"role": "user", "parts": [{"text": request.message}]})
+            history.append({"role": "model", "parts": [{"text": reply_text}]})
+
             # 5. Store Memory (Layer 5.1)
             memory_graph.store_memory(f"User state: {psyche.get('mood')}. User said: {request.message} | AI replied: {reply_text}")
 
