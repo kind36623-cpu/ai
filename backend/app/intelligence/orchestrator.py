@@ -1,25 +1,23 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from app.core.config import Settings
 from app.models.schemas import ChatRequest, ChatResponse
 from app.memory.pinecone_db import memory_graph
 from app.psychology.analyzer import psychology_analyzer
 import os
 import logging
-import warnings
-
-# Suppress the deprecation warning — it's cosmetic only
-warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 
 logger = logging.getLogger(__name__)
 
 # Always load fresh settings
 _settings = Settings()
-
 PRIMARY_MODEL = "gemini-2.0-flash"
 
+# Initialize client
+client = None
 if _settings.gemini_api_key:
-    genai.configure(api_key=_settings.gemini_api_key)
-    logger.info(f"Gemini configured. Model: {PRIMARY_MODEL}")
+    client = genai.Client(api_key=_settings.gemini_api_key)
+    logger.info(f"Gemini client initialized. Model: {PRIMARY_MODEL}")
 else:
     logger.warning("Gemini API key not found.")
 
@@ -37,45 +35,41 @@ You are a private, self-evolving, personal artificial superintelligence assistan
 Current Phase: Phase 4 (Core Intelligence, Memory Graph, and Psychology Layer active).
 """
 
-
 def edit_desktop_ui(filename: str, file_content: str) -> str:
     """
-    Overwrites the desktop UI files (index.html, style.css, or renderer.js) with new content.
-    Call this tool ONLY when the user explicitly asks you to change your visual design, UI, or appearance.
+    Overwrites the desktop UI files (index.html, style.css, or renderer.js).
+    Call ONLY when the user explicitly asks to change the visual design or appearance.
     """
     allowed_files = {"index.html", "style.css", "renderer.js"}
     if filename not in allowed_files:
-        return f"Error: Cannot edit {filename}. Only allowed: {allowed_files}"
+        return f"Error: Cannot edit {filename}. Allowed: {allowed_files}"
     filepath = os.path.join("d:\\ai-revolution\\desktop", filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(file_content)
-        return f"Successfully updated {filename}. The UI will reload automatically."
+        return f"Successfully updated {filename}. UI will reload automatically."
     except Exception as e:
         return f"Error writing file: {e}"
 
 
 class Orchestrator:
     def __init__(self):
-        self.model = genai.GenerativeModel(
-            model_name=PRIMARY_MODEL,
-            system_instruction=MASTER_SYSTEM_PROMPT,
-            tools=[edit_desktop_ui]
-        )
-        self.chat_sessions = {}
+        self.chat_sessions = {}  # session_id -> chat object
 
     def _get_chat(self, session_id: str):
         if session_id not in self.chat_sessions:
-            self.chat_sessions[session_id] = self.model.start_chat(
-                history=[],
-                enable_automatic_function_calling=True
+            self.chat_sessions[session_id] = client.chats.create(
+                model=PRIMARY_MODEL,
+                config=types.GenerateContentConfig(
+                    system_instruction=MASTER_SYSTEM_PROMPT,
+                    temperature=0.7,
+                )
             )
         return self.chat_sessions[session_id]
 
     async def process_request(self, request: ChatRequest) -> ChatResponse:
         logger.info(f"Processing request. Session: {request.session_id}")
         session_id = request.session_id or "default"
-        chat = self._get_chat(session_id)
 
         # Layer 3 — Psychology
         psyche = psychology_analyzer.analyze_state(request.message)
@@ -93,7 +87,8 @@ class Orchestrator:
         enriched = f"{request.message}{psyche_block}{memory_block}"
 
         try:
-            response = await chat.send_message_async(enriched)
+            chat = self._get_chat(session_id)
+            response = chat.send_message(enriched)
             reply_text = response.text
 
             memory_graph.store_memory(
