@@ -1,28 +1,27 @@
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from app.core.config import Settings
 from app.models.schemas import ChatRequest, ChatResponse
 from app.memory.pinecone_db import memory_graph
 from app.psychology.analyzer import psychology_analyzer
 import os
 import logging
+import warnings
+
+# Suppress the deprecation warning — it's cosmetic only
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 
 logger = logging.getLogger(__name__)
 
-# Always load fresh settings (bypass lru_cache)
+# Always load fresh settings
 _settings = Settings()
 
-# Use latest available model
-PRIMARY_MODEL   = "gemini-2.0-flash"
-REASONING_MODEL = "gemini-2.0-flash"
+PRIMARY_MODEL = "gemini-2.0-flash"
 
-# Initialize client
-client = None
 if _settings.gemini_api_key:
-    client = genai.Client(api_key=_settings.gemini_api_key)
-    logger.info(f"Gemini API (google.genai) initialized. Model: {PRIMARY_MODEL}")
+    genai.configure(api_key=_settings.gemini_api_key)
+    logger.info(f"Gemini configured. Model: {PRIMARY_MODEL}")
 else:
-    logger.warning("Gemini API key not found. Orchestrator will fail.")
+    logger.warning("Gemini API key not found.")
 
 MASTER_SYSTEM_PROMPT = """
 ## SYSTEM IDENTITY
@@ -38,6 +37,7 @@ You are a private, self-evolving, personal artificial superintelligence assistan
 Current Phase: Phase 4 (Core Intelligence, Memory Graph, and Psychology Layer active).
 """
 
+
 def edit_desktop_ui(filename: str, file_content: str) -> str:
     """
     Overwrites the desktop UI files (index.html, style.css, or renderer.js) with new content.
@@ -46,7 +46,6 @@ def edit_desktop_ui(filename: str, file_content: str) -> str:
     allowed_files = {"index.html", "style.css", "renderer.js"}
     if filename not in allowed_files:
         return f"Error: Cannot edit {filename}. Only allowed: {allowed_files}"
-    
     filepath = os.path.join("d:\\ai-revolution\\desktop", filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -58,81 +57,67 @@ def edit_desktop_ui(filename: str, file_content: str) -> str:
 
 class Orchestrator:
     def __init__(self):
-        self.is_mock = False
-        self.chat_sessions = {}  # session_id -> list of message dicts
+        self.model = genai.GenerativeModel(
+            model_name=PRIMARY_MODEL,
+            system_instruction=MASTER_SYSTEM_PROMPT,
+            tools=[edit_desktop_ui]
+        )
+        self.chat_sessions = {}
 
-    def _get_history(self, session_id: str):
+    def _get_chat(self, session_id: str):
         if session_id not in self.chat_sessions:
-            self.chat_sessions[session_id] = []
+            self.chat_sessions[session_id] = self.model.start_chat(
+                history=[],
+                enable_automatic_function_calling=True
+            )
         return self.chat_sessions[session_id]
 
     async def process_request(self, request: ChatRequest) -> ChatResponse:
-        """
-        Layer 4: AI Core (Orchestrator)
-        """
-        logger.info(f"Processing request in Orchestrator. Session: {request.session_id}")
-        
-        session_id = request.session_id or "default_session"
-        history = self._get_history(session_id)
+        logger.info(f"Processing request. Session: {request.session_id}")
+        session_id = request.session_id or "default"
+        chat = self._get_chat(session_id)
 
-        # 1. Psychology Analysis (Layer 3)
+        # Layer 3 — Psychology
         psyche = psychology_analyzer.analyze_state(request.message)
-        psyche_block = f"\n\n[USER PSYCHOLOGICAL STATE]\nMood: {psyche.get('mood')}\nStress Level: {psyche.get('stress_level')}\nPreferred Style: {psyche.get('style_preference')}"
-        
-        if psyche.get("stress_level") == "High":
-            psyche_block += "\nWARNING: User is highly stressed. Simplify language, reduce cognitive load, and be highly supportive."
+        psyche_block = (
+            f"\n\n[USER PSYCHOLOGICAL STATE]\n"
+            f"Mood: {psyche.get('mood')}\n"
+            f"Stress: {psyche.get('stress_level')}\n"
+            f"Style: {psyche.get('style_preference')}"
+        )
 
-        # 2. Retrieve Memories (Layer 5.4)
+        # Layer 5 — Memory
         past_memories = memory_graph.retrieve_memories(request.message)
-        memory_block = ""
-        if past_memories:
-            memory_block = f"\n\n[RETRIEVED MEMORIES]\n{past_memories}"
+        memory_block = f"\n\n[RETRIEVED MEMORIES]\n{past_memories}" if past_memories else ""
 
-        enriched_prompt = f"{request.message}{psyche_block}{memory_block}"
+        enriched = f"{request.message}{psyche_block}{memory_block}"
 
-        # 3. Build contents list with history
-        contents = list(history)
-        contents.append({"role": "user", "parts": [{"text": enriched_prompt}]})
-
-        # 4. Dispatch to Gemini
         try:
-            response = client.models.generate_content(
-                model=PRIMARY_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=MASTER_SYSTEM_PROMPT,
-                    temperature=0.7,
-                )
-            )
+            response = await chat.send_message_async(enriched)
             reply_text = response.text
 
-            # Update history
-            history.append({"role": "user", "parts": [{"text": request.message}]})
-            history.append({"role": "model", "parts": [{"text": reply_text}]})
-
-            # 5. Store Memory (Layer 5.1)
-            memory_graph.store_memory(f"User state: {psyche.get('mood')}. User said: {request.message} | AI replied: {reply_text}")
-
-            trace = {
-                "layer_3_psychology": psyche,
-                "layer_4_orchestrator": "Dispatched to Gemini",
-                "layer_5_memory_nodes_retrieved": bool(past_memories),
-            }
+            memory_graph.store_memory(
+                f"User said: {request.message} | AI replied: {reply_text}"
+            )
 
             return ChatResponse(
                 reply=reply_text,
                 confidence_score=0.95,
                 detected_mood=psyche.get("mood"),
-                orchestration_trace=trace
+                orchestration_trace={
+                    "layer_3_psychology": psyche,
+                    "layer_4_orchestrator": "Dispatched to Gemini",
+                    "layer_5_memory_nodes_retrieved": bool(past_memories),
+                }
             )
-            
         except Exception as e:
-            logger.error(f"Error calling API: {e}")
+            logger.error(f"Error calling Gemini: {e}")
             return ChatResponse(
                 reply="I encountered an error connecting to my core intelligence engine.",
                 confidence_score=0.0,
                 orchestration_trace={"error": str(e)}
             )
+
 
 # Global instance
 orchestrator = Orchestrator()
