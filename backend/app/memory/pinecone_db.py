@@ -10,33 +10,38 @@ class MemoryGraph:
     def __init__(self):
         self.is_enabled = bool(settings.pinecone_api_key)
         self.index = None
-        self._encoder = None  # Lazy-loaded on first use
+        self._encoder = None
         self.pc = None
+        self._initialized = False
 
-        if self.is_enabled:
-            try:
-                self.pc = Pinecone(api_key=settings.pinecone_api_key)
-                self.index_name = settings.pinecone_index_name
+    def _initialize_pinecone(self):
+        if self._initialized or not self.is_enabled:
+            return
+            
+        try:
+            self.pc = Pinecone(api_key=settings.pinecone_api_key)
+            self.index_name = settings.pinecone_index_name
 
-                # Check if index exists, create if not
-                existing = [i["name"] for i in self.pc.list_indexes()]
-                if self.index_name not in existing:
-                    logger.info(f"Creating new Pinecone index: {self.index_name}")
-                    self.pc.create_index(
-                        name=self.index_name,
-                        dimension=384,
-                        metric="cosine",
-                        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-                    )
-                    while not self.pc.describe_index(self.index_name).status["ready"]:
-                        time.sleep(1)
+            # Check if index exists, create if not
+            existing = [i["name"] for i in self.pc.list_indexes()]
+            if self.index_name not in existing:
+                logger.info(f"Creating new Pinecone index: {self.index_name}")
+                self.pc.create_index(
+                    name=self.index_name,
+                    dimension=384,
+                    metric="cosine",
+                    spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                )
+                while not self.pc.describe_index(self.index_name).status["ready"]:
+                    time.sleep(1)
 
-                self.index = self.pc.Index(self.index_name)
-                logger.info("Memory Graph (Pinecone) connected. Encoder will load on first use.")
+            self.index = self.pc.Index(self.index_name)
+            self._initialized = True
+            logger.info("Memory Graph (Pinecone) connected.")
 
-            except Exception as e:
-                logger.error(f"Failed to initialize Pinecone: {e}")
-                self.is_enabled = False
+        except Exception as e:
+            logger.error(f"Failed to initialize Pinecone: {e}")
+            self.is_enabled = False
 
     def _get_encoder(self):
         """Lazy-load the embedding model only when first needed."""
@@ -52,6 +57,7 @@ class MemoryGraph:
         if not self.is_enabled:
             return
         try:
+            self._initialize_pinecone()
             encoder = self._get_encoder()
             vector = encoder.encode(text).tolist()
             node_id = f"node_{uuid.uuid4()}"
@@ -72,6 +78,7 @@ class MemoryGraph:
         if not self.is_enabled:
             return ""
         try:
+            self._initialize_pinecone()
             encoder = self._get_encoder()
             query_vector = encoder.encode(query).tolist()
             results = self.index.query(
